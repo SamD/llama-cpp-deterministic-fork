@@ -218,6 +218,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_desc("Minimum hits at ngram lookup for mgram to be proposed"));
 #endif
 
+    // Note: deterministic draft params are configured at server startup via CLI
+    // flags (--det-draft-model, --det-draft-n-max, --det-draft-n-min), not
+    // per-request, since plugin loading happens in common_speculative_init().
+
     add((new field_json("lora"))
         ->set_desc("A list of LoRA adapters to apply to this request. Each entry must have `id` and `scale` fields. Adapters not listed default to scale 0.0")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
@@ -494,13 +498,13 @@ task_params eval_llama_cmpl_schema(
     task_params params;
 
     // Sampling parameter defaults are loaded from the global server context (but individual requests can still them)
-    params.sampling      = params_base.sampling;
-    params.speculative   = params_base.speculative;
-    params.n_keep        = params_base.n_keep;
-    params.n_predict     = params_base.n_predict;
-    params.n_cache_reuse = params_base.n_cache_reuse;
-    params.cache_prompt  = params_base.cache_prompt;
-    params.antiprompt    = params_base.antiprompt;
+    params.sampling               = params_base.sampling;
+    params.speculative            = params_base.speculative;
+    params.n_keep                 = params_base.n_keep;
+    params.n_predict              = params_base.n_predict;
+    params.n_cache_reuse          = params_base.n_cache_reuse;
+    params.cache_prompt           = params_base.cache_prompt;
+    params.antiprompt             = params_base.antiprompt;
 
     // enabling this will output extra debug information in the HTTP responses from the server
     params.verbose       = params_base.verbosity > 9;

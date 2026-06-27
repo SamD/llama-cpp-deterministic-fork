@@ -172,3 +172,13 @@ if (LLAMA_LLGUIDANCE)
 endif()
 
 target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
+
+# When deterministic spec is enabled, link against the spec loader shared library.
+# Using the CMake target name (not an absolute .so path) ensures proper dependency
+# tracking and generator compatibility (Make, Ninja, Xcode, etc.).
+# The deterministic_draft_spec target is defined in external/CMakeLists.txt and
+# propagates its include directories transitively via PUBLIC.
+if (DETERMINISTIC_SPEC_ENABLED)
+    target_compile_definitions(${TARGET} PUBLIC DETERMINISTIC_SPEC_ENABLED)
+    target_link_libraries(${TARGET} PUBLIC deterministic_draft_spec)
+endif()
