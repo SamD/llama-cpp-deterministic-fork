@@ -1516,6 +1516,133 @@ extern "C" {
     LLAMA_API void llama_log_set(ggml_log_callback   log_callback, void *  user_data);
 
     //
+    // Deterministic draft (plugin-based validation)
+    //
+
+    struct llama_deterministic_draft;
+
+    /// @brief Initialize a deterministic draft plugin from a shared library path.
+    /// @return Pointer to the plugin instance, or NULL on failure.
+    LLAMA_API struct llama_deterministic_draft * llama_deterministic_draft_init(const char * plugin_path);
+
+    /// @brief Free a deterministic draft plugin instance.
+    LLAMA_API void llama_deterministic_draft_free(struct llama_deterministic_draft * draft);
+
+    /// @brief Commit an accepted token to the deterministic draft plugin state.
+    /// @param slot_id Inference slot ID (0..N-1, or -1 for single-slot)
+    /// @param token_id The token ID (used by XGrammar's AcceptToken for tokenizer-aware matching)
+    LLAMA_API void llama_deterministic_draft_commit(
+            struct llama_deterministic_draft * draft,
+            int slot_id,
+            int32_t token_id,
+            const char * token_text,
+            int token_length);
+
+    /// @brief Undo the last n_tokens commit() calls for the given slot,
+    ///        restoring the grammar matcher to its prior state. Used when a
+    ///        standard (non-accept-all) verification accepts fewer tokens
+    ///        than the grammar already committed during draft filtering.
+    /// @return true on success, false if unsupported or n_tokens is invalid.
+    LLAMA_API bool llama_deterministic_draft_rollback(
+            struct llama_deterministic_draft * draft,
+            int slot_id,
+            int n_tokens);
+
+    /// @brief Reset the plugin state for the given slot.
+    LLAMA_API void llama_deterministic_draft_reset(
+            struct llama_deterministic_draft * draft,
+            int slot_id);
+
+    /// @brief Select a bundled grammar for the given slot by language name.
+    ///        The plugin resolves and loads the grammar itself (from its own
+    ///        bundled grammar directory) - the host only passes a language name.
+    /// @return true on success, false if the language is unknown or failed to load.
+    LLAMA_API bool llama_deterministic_draft_set_language(
+            struct llama_deterministic_draft * draft,
+            int slot_id,
+            const char * lang);
+
+    /// @brief Get the currently active language for the given slot.
+    LLAMA_API const char * llama_deterministic_draft_get_language(
+            struct llama_deterministic_draft * draft,
+            int slot_id);
+
+    /// @brief Return the plugin version string (e.g. "2.0.0").
+    ///        The returned string is valid for the lifetime of the plugin.
+    LLAMA_API const char * llama_deterministic_draft_get_version(
+            struct llama_deterministic_draft * draft);
+
+    // Capability flags (bitmask) - v3.0.0 plugin API
+    #include "deterministic_draft_capabilities.h"
+    #ifndef LLAMA_DETERMINISTIC_DRAFT_CAPABILITY_BITMASK
+    #define LLAMA_DETERMINISTIC_DRAFT_CAPABILITY_BITMASK      DETERMINISTIC_DRAFT_CAPABILITY_BITMASK
+    #define LLAMA_DETERMINISTIC_DRAFT_CAPABILITY_JUMP_FORWARD DETERMINISTIC_DRAFT_CAPABILITY_JUMP_FORWARD
+    #endif
+
+    /// @brief Query plugin capabilities. Returns bitmask of CAPABILITY_* flags,
+    ///        or 0 if the plugin doesn't implement capability negotiation.
+    LLAMA_API uint32_t llama_deterministic_draft_get_capabilities(
+            struct llama_deterministic_draft * draft);
+
+    /// @brief Provide vocabulary information to the plugin (v3.0.0).
+    ///        Called once after init for plugins that need tokenizer info.
+    /// @return true on success, false on failure. Plugins without this return true.
+    LLAMA_API bool llama_deterministic_draft_set_vocab(
+            struct llama_deterministic_draft * draft,
+            const char ** vocab_entries,
+            int vocab_size,
+            const int32_t * stop_tokens,
+            int n_stop);
+
+    /// @brief Load a grammar from an EBNF/GBNF string (v3.0.0).
+    /// @return true on success, false on failure or if plugin doesn't support grammars.
+    LLAMA_API bool llama_deterministic_draft_set_grammar(
+            struct llama_deterministic_draft * draft,
+            const char * ebnf_str,
+            const char * root_rule);
+
+    /// @brief Fill bitmask with valid token IDs for next step (v3.0.0, CAPABILITY_BITMASK).
+    /// @param bitmask Pre-allocated uint32_t array, size = (vocab_size + 31) / 32
+    /// @return true if bitmask was filled and should be applied, false if no constraint.
+    LLAMA_API bool llama_deterministic_draft_fill_bitmask(
+            struct llama_deterministic_draft * draft,
+            int slot_id,
+            uint32_t * bitmask,
+            int vocab_size);
+
+    /// @brief Get longest string uniquely determined by grammar state (v3.0.0, CAPABILITY_JUMP_FORWARD).
+    /// @return Pointer to jump-forward string (valid until next plugin call), or NULL if none.
+    LLAMA_API const char * llama_deterministic_draft_get_jump_forward(
+            struct llama_deterministic_draft * draft,
+            int slot_id,
+            int * out_length);
+
+    /// @brief Filter draft tokens against grammar bitmask (v3.0.0, CAPABILITY_BITMASK).
+    /// @return Number of leading valid tokens committed to grammar state.
+    LLAMA_API int llama_deterministic_draft_filter_draft(
+            struct llama_deterministic_draft * draft,
+            int slot_id,
+            const int32_t * tokens,
+            int n_tokens);
+
+    /// @brief Fill bitmask and apply to logits (v3.0.0, CAPABILITY_BITMASK).
+    /// @return true if bitmask was applied, false if no constraint needed.
+    LLAMA_API bool llama_deterministic_draft_apply_bitmask(
+            struct llama_deterministic_draft * draft,
+            int slot_id,
+            uint32_t * bitmask,
+            int vocab_size,
+            float * logits);
+
+    /// @brief Commit multiple tokens to grammar state (v3.0.0).
+    /// Converts token IDs to text internally using vocabulary from set_vocab().
+    LLAMA_API void llama_deterministic_draft_commit_tokens(
+            struct llama_deterministic_draft * draft,
+            int slot_id,
+            const int32_t * tokens,
+            int n_tokens);
+
+    //
     // Performance utils
     //
     // NOTE: Used by llama.cpp examples/tools, avoid using in third-party apps. Instead, do your own performance measurements.

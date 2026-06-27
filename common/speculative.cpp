@@ -30,7 +30,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"draft-deterministic", COMMON_SPECULATIVE_TYPE_DRAFT_DETERMINISTIC}
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -1702,6 +1703,18 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     }
 };
 
+struct det_draft_filter {
+    struct llama_deterministic_draft * plugin = nullptr;
+    int32_t                           n_max   = -1;
+    bool                              det_accept_all = false;
+    std::vector<common_det_filter_result> last_result;
+
+    int n_drafts_total       = 0;
+    int n_truncated_total    = 0;
+    int n_tokens_pre_filter  = 0;
+    int n_tokens_post_filter = 0;
+};
+
 struct common_speculative {
     common_speculative_draft_params_vec dparams;
 
@@ -1710,6 +1723,8 @@ struct common_speculative {
 
     // which implementaion was used for a given seq_id
     std::vector<common_speculative_impl *> impl_last;
+
+    det_draft_filter det_filter;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -1774,6 +1789,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DETERMINISTIC: return "draft-deterministic";
         default:                                    return "unknown";
     }
 }
@@ -1840,6 +1856,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
                 break;
             case COMMON_SPECULATIVE_TYPE_NONE:
             case COMMON_SPECULATIVE_TYPE_COUNT:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DETERMINISTIC:
                 break;
         }
     }
@@ -1852,12 +1869,16 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
     // Compute the implementations to use based on the config and their order of preference
     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
+    bool has_mtp = false;
+    bool has_det_filter = false;
     {
         uint32_t enabled_configs = common_get_enabled_speculative_configs(params.types);
 
         bool has_draft_simple = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE));
         bool has_draft_eagle3 = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3)) && params.draft.ctx_dft != nullptr;
-        bool has_mtp = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) && params.draft.ctx_dft != nullptr;
+        has_mtp = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) && params.draft.ctx_dft != nullptr;
+
+        has_det_filter = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_DETERMINISTIC));
 
 
 
@@ -1868,7 +1889,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_ngram_mod     = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MOD));
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 9);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 10);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -1974,8 +1995,67 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     auto * result = new common_speculative {
         /* .dparams   = */ common_speculative_draft_params_vec(n_seq),
         /* .impls     = */ std::move(impls),
-        /* .impl_last = */ std::vector<common_speculative_impl *>(n_seq, nullptr)
+        /* .impl_last = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
+        /* .det_filter = */ det_draft_filter{}
     };
+
+    if (has_det_filter) {
+        if (!has_mtp) {
+            LOG_ERR("%s: deterministic draft requires draft-mtp\n", __func__);
+            delete result;
+            return nullptr;
+        }
+
+        if (params.deterministic_draft.plugin_path.empty()) {
+            LOG_ERR("%s: deterministic draft enabled but no plugin path specified\n", __func__);
+            delete result;
+            return nullptr;
+        }
+
+        result->det_filter.plugin = llama_deterministic_draft_init(params.deterministic_draft.plugin_path.c_str());
+        if (!result->det_filter.plugin) {
+            LOG_ERR("%s: failed to load deterministic draft plugin: %s\n", __func__, params.deterministic_draft.plugin_path.c_str());
+            delete result;
+            return nullptr;
+        }
+
+        // Set vocabulary for the plugin - required for bitmask-capable plugins
+        {
+            const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(params.draft.ctx_tgt));
+            const int n_vocab = llama_vocab_n_tokens(vocab);
+
+            // Build vocab entries array
+            std::vector<std::string> vocab_strings(n_vocab);
+            std::vector<const char *> vocab_entries(n_vocab);
+            for (int i = 0; i < n_vocab; i++) {
+                vocab_strings[i] = common_token_to_piece(vocab, i, false);
+                vocab_entries[i] = vocab_strings[i].c_str();
+            }
+
+            // Collect stop tokens
+            std::vector<int32_t> stop_tokens;
+            for (int i = 0; i < n_vocab; i++) {
+                if (llama_vocab_is_eog(vocab, i)) {
+                    stop_tokens.push_back(i);
+                }
+            }
+
+            if (!llama_deterministic_draft_set_vocab(
+                    result->det_filter.plugin,
+                    vocab_entries.data(), n_vocab,
+                    stop_tokens.data(), (int) stop_tokens.size())) {
+                LOG_WRN("%s: failed to set vocabulary for deterministic draft plugin\n", __func__);
+            }
+        }
+
+        result->det_filter.n_max = params.deterministic_draft.n_max;
+        result->det_filter.det_accept_all = params.deterministic_draft.det_accept_all;
+        result->det_filter.last_result.resize(n_seq);
+
+        LOG_INF("%s: deterministic draft filter enabled (plugin: %s, n_max: %d)\n",
+                __func__, params.deterministic_draft.plugin_path.c_str(),
+                params.deterministic_draft.n_max);
+    }
 
     return result;
 }
@@ -1983,6 +2063,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 void common_speculative_free(common_speculative * spec) {
     if (spec == nullptr) {
         return;
+    }
+
+    if (spec->det_filter.plugin) {
+        llama_deterministic_draft_free(spec->det_filter.plugin);
     }
 
     delete spec;
@@ -2006,6 +2090,13 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
+    }
+
+    if (spec->det_filter.plugin) {
+        llama_deterministic_draft_reset(spec->det_filter.plugin, seq_id);
+        llama_deterministic_draft_commit_tokens(
+            spec->det_filter.plugin, seq_id,
+            prompt.data(), (int) prompt.size());
     }
 }
 
@@ -2130,12 +2221,71 @@ void common_speculative_draft(common_speculative * spec) {
             dp.drafting = false;
         }
     }
+
+    if (spec->det_filter.plugin) {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+            auto & dp   = dparams[seq_id];
+            auto & result = *dp.result;
+
+            if (result.empty()) {
+                continue;
+            }
+
+            if (spec->det_filter.n_max == 0) {
+                continue;
+            }
+
+            if (spec->det_filter.n_max > 0 && (int) result.size() > spec->det_filter.n_max) {
+                result.resize(spec->det_filter.n_max);
+            }
+
+            const int n_pre_filter = (int) result.size();
+
+            auto & fr = spec->det_filter.last_result[seq_id];
+            fr = common_det_filter_result{};
+
+            // Check and commit tokens one at a time through the generic helper:
+            // it truncates the draft at the first grammar-invalid token and
+            // returns the number of accepted leading tokens.
+            const int out_valid = llama_deterministic_draft_filter_draft(
+                spec->det_filter.plugin, seq_id,
+                result.data(), n_pre_filter);
+
+            if (out_valid < n_pre_filter) {
+                fr.truncated   = true;
+                fr.valid_count = out_valid;
+                fr.reject_pos  = out_valid;
+
+                LOG_DBG("%s: det filter truncated draft seq %d from %d to %d tokens\n",
+                        __func__, seq_id, n_pre_filter, out_valid);
+
+                result.resize(out_valid);
+            } else {
+                fr.valid_count = n_pre_filter;
+            }
+
+            // update cumulative stats
+            spec->det_filter.n_drafts_total++;
+            spec->det_filter.n_tokens_pre_filter += n_pre_filter;
+            spec->det_filter.n_tokens_post_filter += (int) result.size();
+            if (fr.truncated) {
+                spec->det_filter.n_truncated_total++;
+            }
+        }
+    }
 }
 
-void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
+void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted, llama_token bonus_token) {
+    if (!spec) {
+        return;
+    }
+
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
-    GGML_ASSERT(impl);
+    if (!impl) {
+        LOG_WRN("%s: no implementation for seq_id %d, skipping accept\n", __func__, seq_id);
+        return;
+    }
 
     {
         common_time_meas tm(impl->t_accept_us, !impl->gen_perf);
@@ -2161,6 +2311,31 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
     for (auto & impl_other : spec->impls) {
         if (impl_other.get() != impl) {
             impl_other->accept(seq_id, n_accepted, true);
+        }
+    }
+
+    if (spec->det_filter.plugin) {
+        // Draft tokens were already committed to the grammar during
+        // common_speculative_draft()'s bitmask-filtering step. In accept-all
+        // mode the grammar is the sole verifier, so n_accepted always matches
+        // the filtered draft size and nothing further is needed here.
+        //
+        // If det_filter is combined with standard target-model rejection
+        // sampling, the target may accept FEWER tokens than the grammar
+        // already committed - roll the grammar back to stay consistent with
+        // what was actually emitted.
+        const auto & fr = spec->det_filter.last_result[seq_id];
+        const int    n_committed = fr.valid_count;
+
+        if (!common_speculative_get_det_accept_all(spec) && n_accepted < (uint16_t) n_committed) {
+            llama_deterministic_draft_rollback(
+                spec->det_filter.plugin, seq_id, n_committed - (int) n_accepted);
+        }
+
+        if (bonus_token != LLAMA_TOKEN_NULL) {
+            llama_deterministic_draft_commit_tokens(
+                spec->det_filter.plugin, seq_id,
+                &bonus_token, 1);
         }
     }
 }
@@ -2234,4 +2409,85 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 str_stats.c_str(),
                 str_perf.c_str());
     }
+
+    // deterministic draft filter stats
+    if (spec->det_filter.plugin) {
+        LOG_INF("statistics %16s: #drafts = %d, #truncated = %d, #tokens pre = %d, #tokens post = %d\n",
+                "draft-deterministic",
+                spec->det_filter.n_drafts_total,
+                spec->det_filter.n_truncated_total,
+                spec->det_filter.n_tokens_pre_filter,
+                spec->det_filter.n_tokens_post_filter);
+    }
+}
+
+bool common_speculative_has_det_filter(const common_speculative * spec) {
+    return spec != nullptr && spec->det_filter.plugin != nullptr;
+}
+
+struct llama_deterministic_draft * common_speculative_get_det_filter_plugin(const common_speculative * spec) {
+    if (spec == nullptr) {
+        return nullptr;
+    }
+    return spec->det_filter.plugin;
+}
+
+bool common_speculative_get_det_accept_all(const common_speculative * spec) {
+    return spec != nullptr && spec->det_filter.plugin != nullptr && spec->det_filter.det_accept_all;
+}
+
+const common_det_filter_result & common_speculative_get_det_filter_result(
+        const common_speculative * spec, llama_seq_id seq_id) {
+    static const common_det_filter_result empty{};
+    if (spec == nullptr || !spec->det_filter.plugin ||
+        seq_id < 0 || seq_id >= (llama_seq_id) spec->det_filter.last_result.size()) {
+        return empty;
+    }
+
+    return spec->det_filter.last_result[seq_id];
+}
+
+llama_tokens common_speculative_sample_and_accept(
+        common_speculative * spec,
+        struct common_sampler * smpl,
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        llama_seq_id seq_id) {
+    (void) seq_id;
+
+    if (common_speculative_get_det_accept_all(spec)) {
+        llama_tokens result;
+        result.reserve(draft.size() + 1);
+
+        for (size_t i = 0; i < draft.size(); i++) {
+            common_sampler_accept(smpl, draft[i], true);
+            result.push_back(draft[i]);
+        }
+
+        // The bonus token is sampled separately from the target's own
+        // distribution - it is NOT part of the already grammar-filtered
+        // draft, so it must be bitmask-constrained here too. Without this,
+        // it would silently bypass the "grammar is the sole verifier"
+        // guarantee that accept-all mode is supposed to provide.
+        if (spec->det_filter.plugin) {
+            float * logits = llama_get_logits_ith(ctx, idxs.back());
+            const llama_model * model = llama_get_model(ctx);
+            const llama_vocab * vocab = llama_model_get_vocab(model);
+            const int vocab_size = llama_vocab_n_tokens(vocab);
+            const int bitmask_words = (vocab_size + 31) / 32;
+            std::vector<uint32_t> bitmask(bitmask_words, 0xFFFFFFFFu);
+            llama_deterministic_draft_apply_bitmask(
+                spec->det_filter.plugin, seq_id,
+                bitmask.data(), vocab_size, logits);
+        }
+
+        const llama_token bonus = common_sampler_sample(smpl, ctx, idxs.back());
+        common_sampler_accept(smpl, bonus, true);
+        result.push_back(bonus);
+
+        return result;
+    }
+
+    return common_sampler_sample_and_accept_n(smpl, ctx, idxs, draft);
 }

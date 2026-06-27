@@ -118,6 +118,7 @@ option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
+option(DETERMINISTIC_SPEC_ENABLED "llama: enable deterministic draft spec and build external SDK artifacts" OFF)
 
 
 # Required for relocatable CMake package
@@ -220,6 +221,13 @@ endif()
 
 if (LLAMA_BUILD_APP)
     add_subdirectory(app)
+endif()
+
+# Build distributable deterministic draft spec SDK artifacts
+# Produces external/include/deterministic_draft_plugin.h and external/lib/libdeterministic_draft_spec.so
+# These are consumed by external plugin projects (e.g., deterministic-draft-model-poc/)
+if (DETERMINISTIC_SPEC_ENABLED)
+    add_subdirectory(external)
 endif()
 
 #
